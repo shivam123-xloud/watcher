@@ -1,0 +1,834 @@
+# Copyright (c) 2016 b<>com
+#
+# Authors: Vincent FRANCOISE <vincent.francoise@b-com.com>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+# implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import ddt
+import fixtures
+import futurist
+import os_resource_classes as orc
+import time
+from unittest import mock
+
+from watcher.common import nova_helper
+from watcher.common import placement_helper
+from watcher.decision_engine.model.collector import nova
+from watcher.decision_engine.model import model_root
+from watcher.tests.fixtures import conf_fixture
+from watcher.tests.unit import base
+from watcher.tests.unit.common import utils as test_utils
+
+
+@ddt.ddt
+class TestNovaClusterDataModelCollector(test_utils.NovaResourcesMixin,
+                                        base.TestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.useFixture(conf_fixture.ConfReloadFixture())
+
+    @mock.patch('keystoneclient.v3.client.Client', mock.Mock())
+    @mock.patch.object(placement_helper, 'PlacementHelper')
+    @mock.patch.object(nova_helper, 'NovaHelper')
+    @mock.patch.object(model_root.ModelRoot, 'extended_attributes_enabled',
+                       new_callable=mock.PropertyMock)
+    @ddt.data(False, True)
+    def test_nova_cdmc_execute(self,
+                               extended_attr_enabled,
+                               m_extended_attr_enabled,
+                               m_nova_helper_cls,
+                               m_placement_helper_cls):
+        # Set the extended_attributes_enabled configuration value
+        m_extended_attr_enabled.return_value = extended_attr_enabled
+
+        m_placement_helper = mock.Mock(name="placement_helper")
+        m_placement_helper.get_inventories.return_value = {
+            orc.VCPU: {
+                "allocation_ratio": 16.0,
+                "total": 8,
+                "reserved": 0,
+                "step_size": 1,
+                "min_unit": 1,
+                "max_unit": 8},
+            orc.MEMORY_MB: {
+                "allocation_ratio": 1.5,
+                "total": 16039,
+                "reserved": 512,
+                "step_size": 1,
+                "min_unit": 1,
+                "max_unit": 16039},
+            orc.DISK_GB: {
+                "allocation_ratio": 1.0,
+                "total": 142,
+                "reserved": 0,
+                "step_size": 1,
+                "min_unit": 1,
+                "max_unit": 142}
+        }
+        m_placement_helper.get_usages_for_resource_provider.return_value = {
+            orc.DISK_GB: 10,
+            orc.MEMORY_MB: 100,
+            orc.VCPU: 0
+        }
+        m_placement_helper_cls.return_value = m_placement_helper
+        m_nova_helper = mock.Mock(name="nova_helper")
+        m_nova_helper_cls.return_value = m_nova_helper
+        m_nova_helper.get_service.return_value = mock.Mock(
+            id=1355,
+            host='test_hostname',
+            binary='nova-compute',
+            status='enabled',
+            state='up',
+            disabled_reason='',
+        )
+        minimal_node = dict(
+            id='160a0e7b-8b0b-4854-8257-9c71dff4efcc',
+            name='test_hostname',
+            state='TEST_STATE',
+            status='TEST_STATUS',
+        )
+        minimal_node_with_servers = dict(
+            servers=[
+                {
+                    'name': 'fake_instance',
+                    'uuid': 'ef500f7e-dac8-470f-960c-169486fce71b'
+                }
+            ],
+            **minimal_node
+        )
+        fake_compute_node = self.create_openstacksdk_hypervisor(
+            service_details={'id': 123, 'host': 'test_hostname',
+                             'disabled_reason': ''},
+            memory_size=333,
+            memory_used=100,
+            free_disk_gb=222,
+            local_disk_size=111,
+            local_disk_used=10,
+            vcpus=4,
+            vcpus_used=0,
+            servers=None,  # Don't let the mock return a value for servers.
+            **minimal_node
+        )
+        fake_detailed_node = self.create_openstacksdk_hypervisor(
+            service_details={'id': 123, 'host': 'test_hostname',
+                             'disabled_reason': ''},
+            memory_size=333,
+            memory_used=100,
+            free_disk_gb=222,
+            local_disk_size=111,
+            local_disk_used=10,
+            vcpus=4,
+            vcpus_used=0,
+            **minimal_node_with_servers)
+        fake_instance = self.create_openstacksdk_server(
+            id='ef500f7e-dac8-470f-960c-169486fce71b',
+            name='fake_instance',
+            flavor={'ram': 333, 'disk': 222, 'vcpus': 4, 'id': 1,
+                    'extra_specs': {'hw_rng:allowed': 'True'}},
+            metadata={'hi': 'hello'},
+            project_id='ff560f7e-dbc8-771f-960c-164482fce21b',
+            pinned_availability_zone='nova',
+            vm_state='VM_STATE',
+        )
+
+        # Returns the hypervisors with details (service_details) but no servers
+        m_nova_helper.get_compute_node_list.return_value = [
+            nova_helper.Hypervisor.from_openstacksdk(fake_compute_node)]
+        # Returns the hypervisor with servers and details (service_details).
+        m_nova_helper.get_compute_node_by_name.return_value = [
+            nova_helper.Hypervisor.from_openstacksdk(fake_detailed_node)]
+        # Returns the hypervisor with details (service_details) but no servers.
+        m_nova_helper.get_instance_list.return_value = [
+            nova_helper.Server.from_openstacksdk(fake_instance)]
+
+        m_config = mock.Mock()
+        m_osc = mock.Mock()
+
+        nova_cdmc = nova.NovaClusterDataModelCollector(
+            config=m_config, osc=m_osc)
+
+        nova_cdmc.get_audit_scope_handler([])
+        model = nova_cdmc.execute()
+
+        compute_nodes = model.get_all_compute_nodes()
+        instances = model.get_all_instances()
+
+        self.assertEqual(1, len(compute_nodes))
+        self.assertEqual(1, len(instances))
+
+        node = list(compute_nodes.values())[0]
+        instance = list(instances.values())[0]
+
+        self.assertEqual(node.uuid, '160a0e7b-8b0b-4854-8257-9c71dff4efcc')
+        self.assertEqual(instance.uuid, 'ef500f7e-dac8-470f-960c-169486fce71b')
+
+        memory_total = (node.memory-node.memory_mb_reserved)*node.memory_ratio
+        self.assertEqual(node.memory_mb_capacity, memory_total)
+
+        disk_total = (node.disk-node.disk_gb_reserved)*node.disk_ratio
+        self.assertEqual(node.disk_gb_capacity, disk_total)
+
+        vcpus_total = (node.vcpus-node.vcpu_reserved)*node.vcpu_ratio
+        self.assertEqual(node.vcpu_capacity, vcpus_total)
+
+        if extended_attr_enabled:
+            self.assertEqual('nova', instance.pinned_az)
+            self.assertEqual({'hw_rng:allowed': 'True'},
+                             instance.flavor_extra_specs)
+        else:
+            self.assertEqual('', instance.pinned_az)
+            self.assertEqual({}, instance.flavor_extra_specs)
+
+        m_nova_helper.get_compute_node_by_name.assert_called_once_with(
+            minimal_node['name'], servers=True, detailed=True)
+        m_nova_helper.get_instance_list.assert_called_once_with(
+            filters={'host': fake_compute_node.service_details['host']},
+            limit=1
+        )
+
+
+@ddt.ddt
+class TestNovaModelBuilder(test_utils.NovaResourcesMixin, base.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.useFixture(
+            fixtures.MockPatch("watcher.common.clients.get_sdk_connection")
+        )
+
+    @mock.patch.object(nova_helper, 'NovaHelper', mock.MagicMock())
+    def test_add_instance_node(self):
+        model_builder = nova.NovaModelBuilder(osc=mock.MagicMock())
+        model_builder.model = mock.MagicMock()
+        mock_node = nova_helper.Hypervisor.from_openstacksdk(
+            self.create_openstacksdk_hypervisor()
+        )
+        mock_host = mock_node.service_host
+        server_info = {
+            'id': 'ef500f7e-dac8-470f-960c-169486fce711',
+            'project_id': 'ff560f7e-dbc8-771f-960c-164482fce21b',
+            'vm_state': 'deleted',
+            'name': 'instance1',
+            'pinned_availability_zone': 'nova',
+            'flavor': {
+                'id': 'tiny', 'ram': 2, 'disk': 4, 'vcpus': 2,
+                'extra_specs': {}
+            }
+        }
+        inst1 = self.create_openstacksdk_server(**server_info)
+
+        server_info = {
+            'id': 'ef500f7e-dac8-470f-960c-169486fce722',
+            'project_id': 'ff560f7e-dbc8-771f-960c-164482fce21b',
+            'vm_state': 'active',
+            'name': 'instance2',
+            'pinned_availability_zone': 'nova',
+            'flavor': {
+                'id': 'tiny', 'ram': 2, 'disk': 4, 'vcpus': 2,
+                'extra_specs': {}
+            }
+        }
+        inst2 = self.create_openstacksdk_server(**server_info)
+
+        mock_instances = [nova_helper.Server.from_openstacksdk(
+            inst1), nova_helper.Server.from_openstacksdk(inst2)]
+        model_builder.nova_helper.get_instance_list.return_value = (
+            mock_instances)
+        model_builder.add_instance_node(mock_node, mock_instances)
+        # verify that when len(instances) <= 1000, limit == len(instance).
+        model_builder.nova_helper.get_instance_list.assert_called_once_with(
+            filters={'host': mock_host}, limit=2)
+        fake_instance = model_builder._build_instance_node(mock_instances[1])
+        model_builder.model.add_instance.assert_called_once_with(
+            fake_instance)
+
+        # verify that when len(instances) > 1000, limit == -1.
+        mock_instance = mock.Mock()
+        mock_instances = [mock_instance] * 1001
+        model_builder.add_instance_node(mock_node, mock_instances)
+        model_builder.nova_helper.get_instance_list.assert_called_with(
+            filters={'host': mock_host}, limit=-1)
+
+    @ddt.unpack
+    # unpacks (extended_attr_enabled, pinned_az_available)
+    @ddt.data((True, True), (True, False), (False, True))
+    @mock.patch.object(nova_helper.NovaHelper, 'is_pinned_az_available')
+    def test__build_instance_node_extended_fields(self,
+                                                  extended_attr_enabled,
+                                                  pinned_az_available,
+                                                  m_is_pinned_az_available):
+        model_builder = nova.NovaModelBuilder(osc=mock.MagicMock())
+        model_builder.model = mock.MagicMock()
+        model_builder.model.extended_attributes_enabled = extended_attr_enabled
+        m_is_pinned_az_available.return_value = pinned_az_available
+
+        server_info = {
+            'id': 'ef500f7e-dac8-470f-960c-169486fce711',
+            'project_id': 'ff560f7e-dbc8-771f-960c-164482fce21b',
+            'pinned_availability_zone': 'nova',
+            'flavor': {'ram': 333, 'disk': 222, 'vcpus': 4, 'id': 1,
+                       'extra_specs': {'hw_rng:allowed': 'True'}},
+            'vm_state': 'active',
+            'name': 'instance1'
+        }
+
+        fake_instance = self.create_openstacksdk_server(**server_info)
+        fake_instance = model_builder._build_instance_node(
+            nova_helper.Server.from_openstacksdk(fake_instance)
+        )
+
+        self.assertEqual(fake_instance.uuid,
+                         'ef500f7e-dac8-470f-960c-169486fce711')
+        self.assertEqual(fake_instance.name, 'instance1')
+        self.assertEqual(fake_instance.state, 'active')
+        self.assertEqual(fake_instance.memory, 333)
+        self.assertEqual(fake_instance.disk, 222)
+        self.assertEqual(fake_instance.vcpus, 4)
+        self.assertEqual(fake_instance.project_id,
+                         'ff560f7e-dbc8-771f-960c-164482fce21b')
+
+        if extended_attr_enabled:
+            expected_pinned_az = 'nova' if pinned_az_available else ''
+            self.assertEqual(expected_pinned_az, fake_instance.pinned_az)
+            self.assertEqual({'hw_rng:allowed': 'True'},
+                             fake_instance.flavor_extra_specs)
+        else:
+            self.assertEqual('', fake_instance.pinned_az)
+            self.assertEqual({}, fake_instance.flavor_extra_specs)
+
+    def test_check_model(self):
+        """Initialize collector ModelBuilder and test check model"""
+
+        m_scope = [{"compute": [
+            {"host_aggregates": [{"id": 5}]},
+            {"availability_zones": [{"name": "av_a"}]}
+        ]}]
+
+        t_nova_cluster = nova.NovaModelBuilder(mock.Mock())
+        self.assertTrue(t_nova_cluster._check_model_scope(m_scope))
+
+    def test_check_model_update_false(self):
+        """Initialize check model with multiple identical scopes
+
+        The seconds check_model should return false as the models are the same
+        """
+
+        m_scope = [{"compute": [
+            {"host_aggregates": [{"id": 5}]},
+            {"availability_zones": [{"name": "av_a"}]}
+        ]}]
+
+        t_nova_cluster = nova.NovaModelBuilder(mock.Mock())
+        self.assertTrue(t_nova_cluster._check_model_scope(m_scope))
+        self.assertFalse(t_nova_cluster._check_model_scope(m_scope))
+
+    def test_check_model_update_true(self):
+        """Initialize check model with multiple different scopes
+
+        Since the models differ both should return True for the update flag
+        """
+
+        m_scope_one = [{"compute": [
+            {"host_aggregates": [{"id": 5}]},
+            {"availability_zones": [{"name": "av_a"}]}
+        ]}]
+
+        m_scope_two = [{"compute": [
+            {"host_aggregates": [{"id": 2}]},
+            {"availability_zones": [{"name": "av_b"}]}
+        ]}]
+
+        t_nova_cluster = nova.NovaModelBuilder(mock.Mock())
+        self.assertTrue(t_nova_cluster._check_model_scope(m_scope_one))
+        self.assertTrue(t_nova_cluster._check_model_scope(m_scope_two))
+
+    def test_merge_compute_scope(self):
+        """"""
+
+        m_scope_one = [
+            {"host_aggregates": [{"id": 5}]},
+            {"availability_zones": [{"name": "av_a"}]}
+        ]
+
+        m_scope_two = [
+            {"host_aggregates": [{"id": 4}]},
+            {"availability_zones": [{"name": "av_b"}]}
+        ]
+
+        reference = {'availability_zones':
+                     [{'name': 'av_a'}, {'name': 'av_b'}],
+                     'host_aggregates':
+                     [{'id': 5}, {'id': 4}]}
+
+        t_nova_cluster = nova.NovaModelBuilder(mock.Mock())
+        t_nova_cluster._merge_compute_scope(m_scope_one)
+        t_nova_cluster._merge_compute_scope(m_scope_two)
+
+        self.assertEqual(reference, t_nova_cluster.model_scope)
+
+    @mock.patch.object(nova_helper, 'NovaHelper')
+    def test_collect_aggregates(self, m_nova):
+        """"""
+
+        agg1 = nova_helper.Aggregate.from_openstacksdk(
+            self.create_openstacksdk_aggregate(id=1, name='example')
+        )
+        agg2 = nova_helper.Aggregate.from_openstacksdk(
+            self.create_openstacksdk_aggregate(
+                id=5, name='example', hosts=['hostone', 'hosttwo'])
+        )
+        m_nova.return_value.get_aggregate_list.return_value = [agg1, agg2]
+
+        m_nova.return_value.get_compute_node_by_name.return_value = False
+
+        m_scope = [{'id': 5}]
+
+        t_nova_cluster = nova.NovaModelBuilder(mock.Mock())
+        result = set()
+        t_nova_cluster._collect_aggregates(m_scope, result)
+
+        self.assertEqual({'hostone', 'hosttwo'}, result)
+
+    @mock.patch.object(nova_helper, 'NovaHelper')
+    def test_collect_aggregates_none(self, m_nova):
+        """Test collect_aggregates with host_aggregates None"""
+        result = set()
+        t_nova_cluster = nova.NovaModelBuilder(mock.Mock())
+        t_nova_cluster._collect_aggregates(None, result)
+
+        self.assertEqual(set(), result)
+
+    @mock.patch.object(nova_helper, 'NovaHelper')
+    def test_collect_zones(self, m_nova):
+        """"""
+
+        svc1 = nova_helper.Service.from_openstacksdk(
+            self.create_openstacksdk_service(zone='av_b')
+        )
+        svc2 = nova_helper.Service.from_openstacksdk(
+            self.create_openstacksdk_service(
+                id='ef500f7e-dac8-470f-960c-169486fce71b',
+                zone='av_a', host='hostone'
+            )
+        )
+        m_nova.return_value.get_service_list.return_value = [svc1, svc2]
+
+        m_nova.return_value.get_compute_node_by_name.return_value = False
+
+        m_scope = [{'name': 'av_a'}]
+
+        t_nova_cluster = nova.NovaModelBuilder(mock.Mock())
+        result = set()
+        t_nova_cluster._collect_zones(m_scope, result)
+
+        self.assertEqual({'hostone'}, result)
+
+    @mock.patch.object(nova_helper, 'NovaHelper')
+    def test_collect_zones_none(self, m_nova):
+        """Test collect_zones with availability_zones None"""
+        result = set()
+        t_nova_cluster = nova.NovaModelBuilder(mock.Mock())
+        t_nova_cluster._collect_zones(None, result)
+
+        self.assertEqual(set(), result)
+
+    @mock.patch.object(placement_helper, 'PlacementHelper')
+    @mock.patch.object(nova_helper, 'NovaHelper')
+    def test_add_physical_layer(self, m_nova, m_placement):
+        """Ensure all three steps of the physical layer are fully executed
+
+        First the return value for get_aggregate_list and get_service_list are
+        mocked. These return 3 hosts of which hostone is returned by both the
+        aggregate and service call. This will help verify the elimination of
+        duplicates. The scope is setup so that only hostone and hosttwo should
+        remain.
+
+        There will be 2 simulated compute nodes and 2 associated instances.
+        These will be returned by their matching calls in nova helper. The
+        calls to get_compute_node_by_name and get_instance_list are asserted
+        as to verify the correct operation of add_physical_layer.
+        """
+
+        mock_placement = mock.Mock(name="placement_helper")
+        mock_placement.get_inventories.return_value = dict()
+        mock_placement.get_usages_for_resource_provider.return_value = None
+        m_placement.return_value = mock_placement
+
+        agg1 = nova_helper.Aggregate.from_openstacksdk(
+            self.create_openstacksdk_aggregate(id=1, name='example')
+        )
+        agg2 = nova_helper.Aggregate.from_openstacksdk(
+            self.create_openstacksdk_aggregate(
+                id=5, name='example', hosts=['hostone', 'hosttwo'])
+        )
+        m_nova.return_value.get_aggregate_list.return_value = [agg1, agg2]
+
+        svc1 = nova_helper.Service.from_openstacksdk(
+            self.create_openstacksdk_service(
+                id='ee500f7e-dac8-470f-960c-169486fce71b',
+                zone='av_b', host='hostthree'
+            )
+        )
+        svc2 = nova_helper.Service.from_openstacksdk(
+            self.create_openstacksdk_service(
+                id='ef500f7e-dac8-470f-960c-169486fce71b',
+                zone='av_a', host='hostone'
+            )
+        )
+        m_nova.return_value.get_service_list.return_value = [svc1, svc2]
+
+        servers = [
+            {
+                'name': 'fake_instance',
+                'uuid': 'ef500f7e-dac8-470f-960c-169486fce71b'
+            }
+        ]
+        compute_node_one = self.create_openstacksdk_hypervisor(
+            id='796fee99-65dd-4262-aabb-fd2a1143faa6',
+            name='hostone',
+            hypervisor_type='QEMU',
+            state='TEST_STATE',
+            status='TEST_STATUS',
+            memory_size=333,
+            memory_used=100,
+            free_disk_gb=222,
+            local_disk_size=111,
+            local_disk_used=10,
+            vcpus=4,
+            vcpus_used=0,
+            servers=servers,
+            service_details={'id': 123, 'host': 'hostone',
+                             'disabled_reason': ''},
+        )
+
+        servers = [
+            {
+                'name': 'fake_instance2',
+                'uuid': 'ef500f7e-dac8-470f-960c-169486fce71b'
+            }
+        ]
+        compute_node_two = self.create_openstacksdk_hypervisor(
+            id='756fef99-65dd-4262-aabb-fd2a1143faa6',
+            name='hosttwo',
+            hypervisor_type='QEMU',
+            state='TEST_STATE',
+            status='TEST_STATUS',
+            memory_size=333,
+            memory_used=100,
+            free_disk_gb=222,
+            local_disk_size=111,
+            local_disk_used=10,
+            vcpus=4,
+            vcpus_used=0,
+            servers=servers,
+            service_details={'id': 123, 'host': 'hosttwo',
+                             'disabled_reason': ''},
+        )
+
+        m_nova.return_value.get_compute_node_by_name.side_effect = [
+            [nova_helper.Hypervisor.from_openstacksdk(compute_node_one)],
+            [nova_helper.Hypervisor.from_openstacksdk(compute_node_two)]
+        ]
+
+        fake_instance_one = self.create_openstacksdk_server(
+            id='796fee99-65dd-4262-aabb-fd2a1143faa6',
+            name='fake_instance',
+            flavor={'ram': 333, 'disk': 222, 'vcpus': 4, 'id': 1},
+            metadata={'hi': 'hello'},
+            project_id='ff560f7e-dbc8-771f-960c-164482fce21b',
+        )
+        fake_instance_two = self.create_openstacksdk_server(
+            id='ef500f7e-dac8-47f0-960c-169486fce71b',
+            name='fake_instance2',
+            flavor={'ram': 333, 'disk': 222, 'vcpus': 4, 'id': 1},
+            metadata={'hi': 'hello'},
+            project_id='756fef99-65dd-4262-aa-fd2a1143faa6',
+        )
+        m_nova.return_value.get_instance_list.side_effect = [
+            [nova_helper.Server.from_openstacksdk(fake_instance_one)],
+            [nova_helper.Server.from_openstacksdk(fake_instance_two)]
+        ]
+
+        m_scope = [{"compute": [
+            {"host_aggregates": [{"id": 5}]},
+            {"availability_zones": [{"name": "av_a"}]}
+        ]}]
+
+        t_nova_cluster = nova.NovaModelBuilder(mock.Mock())
+        t_nova_cluster.execute(m_scope)
+        m_nova.return_value.get_compute_node_by_name.assert_any_call(
+            'hostone', servers=True, detailed=True)
+        m_nova.return_value.get_compute_node_by_name.assert_any_call(
+            'hosttwo', servers=True, detailed=True)
+        self.assertEqual(
+            m_nova.return_value.get_compute_node_by_name.call_count, 2)
+
+        m_nova.return_value.get_instance_list.assert_any_call(
+            filters={'host': 'hostone'}, limit=1)
+        m_nova.return_value.get_instance_list.assert_any_call(
+            filters={'host': 'hosttwo'}, limit=1)
+        self.assertEqual(
+            m_nova.return_value.get_instance_list.call_count, 2)
+
+    @mock.patch.object(futurist.Future, 'cancel')
+    @mock.patch.object(placement_helper, 'PlacementHelper')
+    @mock.patch.object(nova_helper.NovaHelper, 'get_aggregate_list')
+    @mock.patch.object(nova_helper.NovaHelper, 'get_service_list')
+    @mock.patch.object(nova_helper.NovaHelper, 'get_compute_node_by_name')
+    @mock.patch.object(nova.NovaModelBuilder, 'add_instance_node')
+    def test_add_physical_layer_instances_timeout(
+            self, m_add_instance_node, m_nh_compute_name,
+            m_nh_service, m_nh_aggr, m_placement, m_fut_cancel):
+        """Test add_physical_layer with timeout on collecting aggregates"""
+        mock_placement = mock.Mock(name="placement_helper")
+        mock_placement.get_inventories.return_value = dict()
+        mock_placement.get_usages_for_resource_provider.return_value = None
+        m_placement.return_value = mock_placement
+
+        agg1 = nova_helper.Aggregate.from_openstacksdk(
+            self.create_openstacksdk_aggregate(id=1, name='example')
+        )
+        agg2 = nova_helper.Aggregate.from_openstacksdk(
+            self.create_openstacksdk_aggregate(
+                id=5, name='example', hosts=['hostone', 'hosttwo'])
+        )
+        m_nh_aggr.return_value = ([agg1, agg2])
+
+        svc1 = nova_helper.Service.from_openstacksdk(
+            self.create_openstacksdk_service(
+                zone='av_b', host='hostthree'
+            )
+        )
+        svc2 = nova_helper.Service.from_openstacksdk(
+            self.create_openstacksdk_service(
+                zone='av_a', host='hostone'
+            )
+        )
+
+        m_nh_service.return_value = ([svc1, svc2])
+
+        compute_node_one_info = {
+            'id': '796fee99-65dd-4262-aabb-fd2a1143faa6',
+            'hypervisor_hostname': 'hostone',
+            'hypervisor_type': 'QEMU',
+            'state': 'TEST_STATE',
+            'status': 'TEST_STATUS',
+            'memory_mb': 333,
+            'memory_mb_used': 100,
+            'free_disk_gb': 222,
+            'local_gb': 111,
+            'local_gb_used': 10,
+            'vcpus': 4,
+            'vcpus_used': 0,
+            'servers': [
+                {'name': 'fake_instance',
+                 'uuid': 'ef500f7e-dac8-470f-960c-169486fce71b'}
+            ],
+            'service': {'id': 123, 'host': 'hostone',
+                        'disabled_reason': ''},
+        }
+
+        compute_node_one = nova_helper.Hypervisor.from_openstacksdk(
+            self.create_openstacksdk_hypervisor(**compute_node_one_info)
+        )
+
+        compute_node_two_info = {
+            'id': '796fee99-65dd-4262-aabb-fd2a1143faa7',
+            'hypervisor_hostname': 'hosttwo',
+            'hypervisor_type': 'QEMU',
+            'state': 'TEST_STATE',
+            'status': 'TEST_STATUS',
+            'memory_mb': 333,
+            'memory_mb_used': 100,
+            'free_disk_gb': 222,
+            'local_gb': 111,
+            'local_gb_used': 10,
+            'vcpus': 4,
+            'vcpus_used': 0,
+            'servers': [
+                {'name': 'fake_instance2',
+                 'uuid': 'ef500f7e-dac8-47f0-960c-169486fce71b'}
+            ],
+            'service': {'id': 123, 'host': 'hosttwo',
+                        'disabled_reason': ''},
+        }
+
+        compute_node_two = nova_helper.Hypervisor.from_openstacksdk(
+            self.create_openstacksdk_hypervisor(**compute_node_two_info)
+        )
+
+        # Set max general workers to 1 to ensure only one worker is used
+        # and we timed out on collecting instances
+        self.flags(max_general_workers=1, group='watcher_decision_engine')
+
+        m_nh_compute_name.side_effect = [
+            [compute_node_one], [compute_node_two]
+        ]
+
+        m_scope = [{"compute": [
+            {"host_aggregates": [{"id": 5}]},
+            {"availability_zones": [{"name": "av_a"}]}
+        ]}]
+
+        def fake_collector(self, *args):
+            return time.sleep(0.5)
+
+        m_add_instance_node.side_effect = mock.Mock(
+            side_effect=fake_collector)
+
+        t_nova_cluster = nova.NovaModelBuilder(mock.Mock())
+        # NOTE(dviroel): ModelBuilder reads the timeout directly
+        # from the configuration and don't allow value lower than 30s
+        # Here we need to set the value to 0.1 to simulate
+        # a timeout without adding huge sleeps in the fake collector.
+        t_nova_cluster.collector_timeout = 0.1
+
+        model = t_nova_cluster.execute(m_scope)
+
+        # Assert that futures were cancelled
+        m_fut_cancel.assert_has_calls([mock.call() for _ in range(2)])
+
+        self.assertEqual(len(model.get_all_compute_nodes()), 2)
+        # Instances should not be added to the model due to timeout
+        self.assertEqual(len(model.get_all_instances()), 0)
+
+    @mock.patch.object(nova_helper.NovaHelper, 'get_compute_node_list')
+    @mock.patch.object(nova_helper.NovaHelper, 'get_compute_node_by_name')
+    @mock.patch.object(nova.NovaModelBuilder, '_collect_aggregates')
+    @mock.patch.object(nova.NovaModelBuilder, '_collect_zones')
+    def test_add_physical_layer_aggregates_timeout(
+            self, m_collect_zones, m_collect_aggregates,
+            m_nh_node_name, m_nh_node_list):
+        """Test add_physical_layer with timeout on collecting aggregates"""
+
+        self.flags(max_general_workers=1, group='watcher_decision_engine')
+
+        def fake_collector(self, *args):
+            pass
+
+        m_collect_aggregates.side_effect = mock.Mock(
+            side_effect=fake_collector)
+        m_collect_zones.side_effect = mock.Mock(
+            side_effect=fake_collector)
+
+        t_nova_cluster = nova.NovaModelBuilder(mock.Mock())
+        # NOTE(dviroel): ModelBuilder reads the timeout directly
+        # from the configuration and don't allow value lower than 30s
+        # Setting timeout to 0 so waiter will return immediately
+        t_nova_cluster.collector_timeout = 0
+
+        m_scope = [{"compute": []}]
+
+        model = t_nova_cluster.execute(m_scope)
+        # Model shouldn't have any updated compute nodes
+        self.assertEqual(len(model.get_all_compute_nodes()), 0)
+
+        # Get compute node list and by name shouldn't be called
+        m_nh_node_list.assert_not_called()
+        m_nh_node_name.assert_not_called()
+
+    @mock.patch.object(placement_helper, 'PlacementHelper')
+    @mock.patch.object(nova_helper, 'NovaHelper')
+    def test_add_physical_layer_with_baremetal_node(self, m_nova,
+                                                    m_placement_helper):
+        """"""
+        mock_placement = mock.Mock(name="placement_helper")
+        mock_placement.get_inventories.return_value = dict()
+        mock_placement.get_usages_for_resource_provider.return_value = None
+        m_placement_helper.return_value = mock_placement
+        agg1 = nova_helper.Aggregate.from_openstacksdk(
+            self.create_openstacksdk_aggregate(id=1, name='example')
+        )
+        agg2 = nova_helper.Aggregate.from_openstacksdk(
+            self.create_openstacksdk_aggregate(
+                id=5, name='example', hosts=['hostone', 'hosttwo'])
+        )
+        m_nova.return_value.get_aggregate_list.return_value = [agg1, agg2]
+
+        svc1 = nova_helper.Service.from_openstacksdk(
+            self.create_openstacksdk_service(
+                id='ee500f7e-dac8-470f-960c-169486fce71b',
+                zone='av_b', host='hostthree'
+            )
+        )
+        svc2 = nova_helper.Service.from_openstacksdk(
+            self.create_openstacksdk_service(
+                id='ef500f7e-dac8-470f-960c-169486fce71b',
+                zone='av_a', host='hostone'
+            )
+        )
+        m_nova.return_value.get_service_list.return_value = [svc1, svc2]
+
+        servers = [
+            {
+                'name': 'fake_instance',
+                'uuid': 'ef500f7e-dac8-470f-960c-169486fce71b'
+            }
+        ]
+        compute_node = self.create_openstacksdk_hypervisor(
+            id='796fee99-65dd-4262-aabb-fd2a1143faa6',
+            name='hostone',
+            hypervisor_type='QEMU',
+            state='TEST_STATE',
+            status='TEST_STATUS',
+            memory_size=333,
+            memory_used=100,
+            free_disk_gb=222,
+            local_disk_size=111,
+            local_disk_used=10,
+            vcpus=4,
+            vcpus_used=0,
+            servers=servers,
+            service_details={'id': 123, 'host': 'hostone',
+                             'disabled_reason': ''},
+        )
+
+        baremetal_node = self.create_openstacksdk_hypervisor(
+            id='5f2d1b3d-4099-4623-b9b9-05148aefd6cb',
+            name='hosttwo',
+            hypervisor_type='ironic',
+            state='TEST_STATE',
+            status='TEST_STATUS',
+        )
+
+        m_nova.return_value.get_compute_node_by_name.side_effect = [
+            [nova_helper.Hypervisor.from_openstacksdk(compute_node)],
+            [nova_helper.Hypervisor.from_openstacksdk(baremetal_node)]]
+
+        m_scope = [{"compute": [
+            {"host_aggregates": [{"id": 5}]},
+            {"availability_zones": [{"name": "av_a"}]}
+        ]}]
+
+        t_nova_cluster = nova.NovaModelBuilder(mock.Mock())
+        model = t_nova_cluster.execute(m_scope)
+
+        compute_nodes = model.get_all_compute_nodes()
+        self.assertEqual(1, len(compute_nodes))
+        m_nova.return_value.get_compute_node_by_name.assert_any_call(
+            'hostone', servers=True, detailed=True)
+        m_nova.return_value.get_compute_node_by_name.assert_any_call(
+            'hosttwo', servers=True, detailed=True)
+        self.assertEqual(
+            m_nova.return_value.get_compute_node_by_name.call_count, 2)
+
+    def test_nova_model_builder_timeout_configuration(self):
+        """Test that model builder timeout is configured"""
+
+        self.flags(compute_resources_collector_timeout=123,
+                   group='collector')
+
+        t_nova_cluster = nova.NovaModelBuilder(mock.Mock())
+
+        self.assertEqual(t_nova_cluster.collector_timeout, 123)

@@ -1,0 +1,77 @@
+# Copyright © 2012 New Dream Network, LLC (DreamHost)
+# All Rights Reserved.
+# Copyright (c) 2016 Intel Corp
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+
+from oslo_middleware import cors
+from oslo_middleware import http_proxy_to_wsgi
+from oslo_middleware import request_id
+import pecan
+
+from watcher.api import acl
+from watcher.api import config as api_config
+from watcher.api.middleware import parsable_error
+from watcher import conf
+
+CONF = conf.CONF
+
+
+def get_pecan_config():
+    # Set up the pecan configuration
+    return pecan.configuration.conf_from_dict(api_config.PECAN_CONFIG)
+
+
+def setup_app(config=None):
+    if not config:
+        config = get_pecan_config()
+
+    app_conf = dict(config.app)
+
+    app = pecan.make_app(
+        app_conf.pop('root'),
+        logging=getattr(config, 'logging', {}),
+        debug=CONF.debug,
+        wrap_app=_wrap_app,
+        **app_conf
+    )
+
+    return acl.install(app, CONF, config.app.acl_public_routes)
+
+
+def _wrap_app(app):
+    """Wraps wsgi app with additional middlewares."""
+    app = parsable_error.ParsableErrorMiddleware(app)
+
+    app = request_id.RequestId(app)
+
+    app = http_proxy_to_wsgi.HTTPProxyToWSGI(app)
+
+    # This should be the last middleware in the list (which results in
+    # it being the first in the middleware chain). This is to ensure
+    # that any errors thrown by other middleware, such as an auth
+    # middleware - are annotated with CORS headers, and thus accessible
+    # by the browser.
+    app = cors.CORS(app, CONF)
+
+    return app
+
+
+class VersionSelectorApplication:
+    def __init__(self):
+        pc = get_pecan_config()
+        self.v1 = setup_app(config=pc)
+
+    def __call__(self, environ, start_response):
+        return self.v1(environ, start_response)
