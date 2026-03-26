@@ -1,0 +1,13 @@
+prometheus:
+  instance_cpu_usage: >-
+    avg(rate(libvirt_domain_vcpu_time_seconds_total[%(period)ss])) by (domain) * on (domain) group_left() libvirt_domain_openstack_info{instance_id="%(resource)s"} * 100
+  instance_ram_usage: >-
+    sum(libvirt_domain_memory_stats_rss_bytes) by (domain) * on (domain) group_left() libvirt_domain_openstack_info{instance_id="%(resource)s"} / 1024 / 1024
+  host_airflow: >-
+    avg(ipmi_fan_speed_rpm{hostname="%(fqdn)s"})
+  host_inlet_temp: >-
+    ipmi_temperature_celsius{hostname="%(fqdn)s",name="Inlet Temp"}
+  host_outlet_temp: >-
+    ipmi_temperature_celsius{hostname="%(fqdn)s",name="Exhaust Temp"}
+  host_power: >-
+    ipmi_dcmi_power_consumption_watts{hostname="%(fqdn)s"}
